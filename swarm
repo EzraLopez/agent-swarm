@@ -14,20 +14,27 @@ VERSION="0.1.0"
 
 # Agent registry: name → binary, autonomous-mode flags
 # Format: "binary|autonomous_flags"
-declare -A KNOWN_AGENTS=(
-  ["claude"]="claude|--dangerously-skip-permissions"
-  ["codex"]="codex|--full-auto"
-  ["agy"]="agy|--yolo"
-  ["antigravity"]="agy|--yolo"
-  ["pocket"]="pocket|"
-  ["kiro"]="kiro-cli|"
-  ["grok"]="grok|"
-  ["opencode"]="opencode|--auto"
-  ["cursor"]="cursor-agent|--auto"
-  ["cursor-agent"]="cursor-agent|--auto"
-  ["copilot"]="copilot|"
-  ["muse"]="muse|--yolo"
-)
+AGENTS="claude codex agy antigravity pocket kiro grok opencode cursor cursor-agent copilot muse"
+
+# Resolve agent name to "binary flags"
+agent_info() {
+  case "$1" in
+    claude)         echo "claude --dangerously-skip-permissions" ;;
+    codex)          echo "codex --full-auto" ;;
+    agy|antigravity) echo "agy --yolo" ;;
+    pocket)         echo "pocket" ;;
+    kiro)           echo "kiro-cli" ;;
+    grok)           echo "grok" ;;
+    opencode)       echo "opencode --auto" ;;
+    cursor|cursor-agent) echo "cursor-agent --auto" ;;
+    copilot)        echo "copilot" ;;
+    muse)           echo "muse --yolo" ;;
+    *)              return 1 ;;
+  esac
+}
+
+agent_binary() { agent_info "$1" | awk '{print $1}'; }
+agent_flags()  { agent_info "$1" | awk '{print $2}' | grep -v '^$' || true; }
 
 # ─── Colors ───────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -122,21 +129,20 @@ state_find_session() {
 
 state_session_exists() {
   local id="$1"
-  [ "$(jq --arg id "$id" '.[] | select(.id == $id) | .id' "$STATE_FILE")" = "$id" ]
+  [ "$(jq -r --arg id "$id" '.[] | select(.id == $id) | .id' "$STATE_FILE")" = "$id" ]
 }
 
 # ─── Agent resolution ──────────────────────────────────────
 resolve_agent() {
   local name="$1"
-  local entry="${KNOWN_AGENTS[$name]:-}"
-  [ -z "$entry" ] && die "Unknown agent: $name. Run 'swarm agents' to see known agents."
+  local info
+  info=$(agent_info "$name") || die "Unknown agent: $name. Run 'swarm agents' to see known agents."
   
-  local binary="${entry%%|*}"
-  local flags="${entry##*|}"
-  
+  local binary
+  binary=$(echo "$info" | awk '{print $1}')
   command -v "$binary" &>/dev/null || die "Agent binary not found: $binary"
   
-  echo "$binary $flags"
+  echo "$info"
 }
 
 # ─── Commands ──────────────────────────────────────────────
@@ -147,11 +153,11 @@ cmd_agents() {
   printf "${BOLD}%-15s %-15s %-8s %s${NC}\n" "Agent" "Binary" "Available" "Autonomous flags"
   printf "%-15s %-15s %-8s %s\n" "─────────────" "─────────────" "────────" "─────────────────────"
   
-  for name in $(echo "${!KNOWN_AGENTS[@]}" | tr ' ' '\n' | sort -u); do
-    local entry="${KNOWN_AGENTS[$name]}"
-    local binary="${entry%%|*}"
-    local flags="${entry##*|}"
-    local avail
+  for name in $AGENTS; do
+    local info binary flags avail
+    info=$(agent_info "$name" 2>/dev/null) || continue
+    binary=$(echo "$info" | awk '{print $1}')
+    flags=$(echo "$info" | awk '{print $2}')
     if command -v "$binary" &>/dev/null; then
       avail="${GREEN}yes${NC}"
     else
