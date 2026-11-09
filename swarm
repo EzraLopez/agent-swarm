@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+# swarm — minimal, secure agent orchestrator
+# Manages multiple AI coding agents in isolated git worktrees + tmux sessions.
+set -euo pipefail
+
+# ─── Constants ────────────────────────────────────────────
+SWARM_SOCKET="agent-swarm"
+SWARM_DIR="$HOME/.agent-swarm"
+STATE_FILE="$SWARM_DIR/state.json"
+WORKTREE_DIR=".swarm/worktrees"
+BRANCH_PREFIX="swarm"
+SESSION_PREFIX="swarm_"
+VERSION="0.1.0"
+
+# Agent registry: name → binary, autonomous-mode flags
+# Format: "binary|autonomous_flags"
+declare -A KNOWN_AGENTS=(
+  ["claude"]="claude|--dangerously-skip-permissions"
+  ["codex"]="codex|--full-auto"
+  ["agy"]="agy|--yolo"
+  ["antigravity"]="agy|--yolo"
+  ["pocket"]="pocket|"
+  ["kiro"]="kiro-cli|"
+  ["grok"]="grok|"
+  ["opencode"]="opencode|--auto"
+  ["cursor"]="cursor-agent|--auto"
+  ["cursor-agent"]="cursor-agent|--auto"
+  ["copilot"]="copilot|"
+  ["muse"]="muse|--yolo"
+)
+
+# ─── Colors ───────────────────────────────────────────────
+if [ -t 1 ]; then
+  BOLD='\033[1m'; DIM='\033[2m'; GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'
+  CYAN='\033[0;36m'; NC='\033[0m'
+else
+  BOLD=''; DIM=''; GREEN=''; YELLOW=''; RED=''; BLUE=''; CYAN=''; NC=''
+fi
+
+# ─── Helpers ───────────────────────────────────────────────
+die() { printf "${RED}error:${NC} %s\n" "$*" >&2; exit 1; }
+info() { printf "${BLUE}::${NC} %s\n" "$*"; }
+ok() { printf "${GREEN}✓${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}⚠${NC} %s\n" "$*"; }
+
+ensure_deps() {
+  local missing=()
+  command -v tmux &>/dev/null || missing+=("tmux")
+  command -v git &>/dev/null || missing+=("git")
+  command -v jq &>/dev/null || missing+=("jq")
+  if [ ${#missing[@]} -gt 0 ]; then
+    die "Missing dependencies: ${missing[*]}. Install with: brew install ${missing[*]}"
+  fi
+}
+
+ensure_swarm_dir() {
+  mkdir -p "$SWARM_DIR"
+  if [ ! -f "$STATE_FILE" ]; then
+    echo '[]' > "$STATE_FILE"
+  fi
+}
+
+# tmux wrapper — always use dedicated socket
+tmux-swarm() { tmux -L "$SWARM_SOCKET" "$@"; }
+
+# Generate a short session ID
+gen_id() {
+  local ts=$(date +%s)
+  local rand=$(printf '%04x' $((RANDOM % 65536)))
+  echo "${ts}-${rand}"
+}
+
+# Sanitize a string for use as a branch name / directory name
+sanitize() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'; }
+
+# Get the git repo root
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || die "Not in a git repository."; }
+
+# Get current branch (main or master)
+default_branch() {
+  local b
+  b=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+  [ -z "$b" ] && b="main"
+  # Fallback: check if main exists, else master
+  if ! git show-ref --verify --quiet "refs/heads/$b" 2>/dev/null; then
+    if git show-ref --verify --quiet "refs/heads/main" 2>/dev/null; then
+      b="main"
+    elif git show-ref --verify --quiet "refs/heads/master" 2>/dev/null; then
+      b="master"
+    fi
+  fi
+  echo "$b"
+}
+
+# ─── State management (JSON via jq) ────────────────────────
+state_get() { jq -r "$1" "$STATE_FILE"; }
+
+state_add_session() {
+  local session_json="$1"
+  jq --argjson session "$session_json" '. + [$session]' "$STATE_FILE" > "$STATE_FILE.tmp" \
+    && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_update_session() {
+  local id="$1" key="$2" value="$3"
+  jq --arg id "$id" --arg key "$key" --arg value "$value" \
+    'map(if .id == $id then .[$key] = $value else . end)' \
+    "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_remove_session() {
+  local id="$1"
+  jq --arg id "$id" 'map(select(.id != $id))' "$STATE_FILE" > "$STATE_FILE.tmp" \
+    && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_find_session() {
+  local id="$1"
+  jq --arg id "$id" '.[] | select(.id == $id)' "$STATE_FILE"
+}
+
+state_session_exists() {
+  local id="$1"
+  [ "$(jq --arg id "$id" '.[] | select(.id == $id) | .id' "$STATE_FILE")" = "$id" ]
+}
+
+# ─── Agent resolution ──────────────────────────────────────
+resolve_agent() {
+  local name="$1"
+  local entry="${KNOWN_AGENTS[$name]:-}"
+  [ -z "$entry" ] && die "Unknown agent: $name. Run 'swarm agents' to see known agents."
+  
+  local binary="${entry%%|*}"
+  local flags="${entry##*|}"
+  
+  command -v "$binary" &>/dev/null || die "Agent binary not found: $binary"
+  
+  echo "$binary $flags"
+}
+
+# ─── Commands ──────────────────────────────────────────────
+
+cmd_agents() {
+  echo "${BOLD}Known Agents${NC}"
+  echo ""
+  printf "${BOLD}%-15s %-15s %-8s %s${NC}\n" "Agent" "Binary" "Available" "Autonomous flags"
+  printf "%-15s %-15s %-8s %s\n" "─────────────" "─────────────" "────────" "─────────────────────"
+  
+  for name in $(echo "${!KNOWN_AGENTS[@]}" | tr ' ' '\n' | sort -u); do
+    local entry="${KNOWN_AGENTS[$name]}"
+    local binary="${entry%%|*}"
+    local flags="${entry##*|}"
+    local avail
+    if command -v "$binary" &>/dev/null; then
+      avail="${GREEN}yes${NC}"
+    else
+      avail="${RED}no${NC}"
+    fi
+    printf "%-15s %-15s %-8s %s\n" "$name" "$binary" "$avail" "${flags:-none}"
+  done
+  echo ""
+  echo "${DIM}Aliases: antigravity→agy, cursor→cursor-agent${NC}"
+}
+
+cmd_launch() {
+  ensure_deps
+  ensure_swarm_dir
+  
+  local agent_name="${1:-}"
+  local prompt="${2:-}"
+  
+  [ -z "$agent_name" ] && die "Usage: swarm launch <agent> [prompt]"
+  
+  local agent_cmd
+  agent_cmd=$(resolve_agent "$agent_name")
+  local binary="${agent_cmd%% *}"
+  
+  local repo
+  repo=$(repo_root)
+  local base_branch
+  base_branch=$(default_branch)
+  
+  local id
+  id=$(gen_id)
+  local slug
+  slug=$(sanitize "$agent_name")
+  local branch="${BRANCH_PREFIX}/${slug}-${id}"
+  local wt_dir="$repo/$WORKTREE_DIR"
+  local wt_path="$wt_dir/$slug-$id"
+  local session_name="${SESSION_PREFIX}${slug}-${id}"
+  local base_commit
+  base_commit=$(git -C "$repo" rev-parse HEAD)
+  
+  # Create worktree
+  mkdir -p "$wt_dir"
+  info "Creating worktree: $wt_path (branch: $branch)"
+  git -C "$repo" worktree add -b "$branch" "$wt_path" "$base_commit" 2>/dev/null \
+    || die "Failed to create worktree"
+  
+  # Build the command to run in tmux
+  local full_cmd="$agent_cmd"
+  [ -n "$prompt" ] && full_cmd="$agent_cmd \"$prompt\""
+  
+  # Create tmux session
+  info "Launching ${BOLD}$agent_name${NC} in tmux session: $session_name"
+  tmux-swarm new-session -d -s "$session_name" -c "$wt_path" "$full_cmd" 2>/dev/null \
+    || { git -C "$repo" worktree remove -f "$wt_path" 2>/dev/null; die "Failed to create tmux session"; }
+  tmux-swarm set-environment -t "$session_name" SWARM_ID "$id" 2>/dev/null || true
+  
+  # Add .swarm to gitignore if not already there
+  grep -q '.swarm/' "$repo/.gitignore" 2>/dev/null || echo '.swarm/' >> "$repo/.gitignore"
+  
+  # Save state
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local session_json
+  session_json=$(jq -n \
+    --arg id "$id" \
+    --arg agent "$agent_name" \
+    --arg binary "$binary" \
+    --arg repo "$repo" \
+    --arg worktree "$wt_path" \
+    --arg branch "$branch" \
+    --arg baseCommit "$base_commit" \
+    --arg session "$session_name" \
+    --arg status "running" \
+    --arg prompt "$prompt" \
+    --arg createdAt "$now" \
+    --arg updatedAt "$now" \
+    '{id:$id, agent:$agent, binary:$binary, repo:$repo, worktree:$worktree, branch:$branch, baseCommit:$baseCommit, tmuxSession:$session, status:$status, prompt:$prompt, createdAt:$createdAt, updatedAt:$updatedAt}')
+  
+  state_add_session "$session_json"
+  
+  ok "Launched ${BOLD}$agent_name${NC} as session ${BOLD}$id${NC}"
+  echo ""
+  echo "  ${DIM}Worktree:${NC}  $wt_path"
+  echo "  ${DIM}Branch:${NC}    $branch"
+  [ -n "$prompt" ] && echo "  ${DIM}Prompt:${NC}    $prompt"
+  echo ""
+  echo "  Attach:  ${BOLD}swarm attach $id${NC}"
+  echo "  Pause:   ${BOLD}swarm pause $id${NC}"
+  echo "  Diff:    ${BOLD}swarm diff $id${NC}"
+}
+
+cmd_list() {
+  ensure_swarm_dir
+  local sessions
+  sessions=$(state_get '.')
+  
+  if [ "$sessions" = "[]" ] || [ -z "$sessions" ]; then
+    echo "${DIM}No sessions. Run 'swarm launch <agent>' to start one.${NC}"
+    return 0
+  fi
+  
+  echo "${BOLD}Swarm Sessions${NC}"
+  echo ""
+  printf "${BOLD}%-14s %-12s %-10s %-30s %s${NC}\n" "ID" "Agent" "Status" "Branch" "Prompt"
+  printf "%-14s %-12s %-10s %-30s %s\n" "─────────────" "──────────" "────────" "──────────────────────────" "──────────"
+  
+  echo "$sessions" | jq -r '.[] | "\(.id) \(.agent) \(.status) \(.branch) \(.prompt[:50])"' | while read -r id agent status branch prompt; do
+    # Check actual tmux liveness
+    local session_name
+    session_name=$(echo "$sessions" | jq -r --arg id "$id" '.[] | select(.id == $id) | .tmuxSession')
+    if [ "$status" = "running" ]; then
+      if ! tmux-swarm has-session -t "$session_name" 2>/dev/null; then
+        status="paused"
+        state_update_session "$id" "status" "paused" 2>/dev/null || true
+      fi
+    fi
+    
+    local status_color
+    case "$status" in
+      running) status_color="$GREEN$status$NC" ;;
+      paused)  status_color="$YELLOW$status$NC" ;;
+      *)       status_color="$DIM$status$NC" ;;
+    esac
+    
+    printf "%-14s %-12s %-10s %-30s %s\n" "$id" "$agent" "$(printf "$status_color")" "$branch" "${prompt:-(no prompt)}"
+  done
+  echo ""
+  local count
+  count=$(echo "$sessions" | jq 'length')
+  echo "${DIM}$count session(s)${NC}"
+}
+
+cmd_attach() {
+  ensure_deps
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm attach <id>"
+  
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local session_name
+  session_name=$(state_find_session "$id" | jq -r '.tmuxSession')
+  local status
+  status=$(state_find_session "$id" | jq -r '.status')
+  
+  if [ "$status" = "paused" ]; then
+    warn "Session is paused. Run 'swarm resume $id' first."
+    return 1
+  fi
+  
+  tmux-swarm has-session -t "$session_name" 2>/dev/null || die "tmux session not found: $session_name"
+  
+  info "Attaching to $id (Ctrl-B then D to detach)"
+  tmux-swarm attach-session -t "$session_name"
+}
+
+cmd_pause() {
+  ensure_deps
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm pause <id>"
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local session_name worktree branch repo
+  session_name=$(state_find_session "$id" | jq -r '.tmuxSession')
+  worktree=$(state_find_session "$id" | jq -r '.worktree')
+  branch=$(state_find_session "$id" | jq -r '.branch')
+  repo=$(state_find_session "$id" | jq -r '.repo')
+  
+  # Kill tmux session
+  if tmux-swarm has-session -t "$session_name" 2>/dev/null; then
+    info "Stopping tmux session..."
+    tmux-swarm kill-session -t "$session_name" 2>/dev/null || true
+  fi
+  
+  # Commit any uncommitted work
+  if [ -d "$worktree" ]; then
+    info "Committing uncommitted work..."
+    git -C "$worktree" add -A 2>/dev/null || true
+    git -C "$worktree" commit -m "swarm: auto-save before pause ($id)" --no-verify 2>/dev/null || true
+  fi
+  
+  # Remove worktree but keep the branch
+  info "Removing worktree (branch preserved: $branch)"
+  git -C "$repo" worktree remove "$worktree" 2>/dev/null || git -C "$repo" worktree remove --force "$worktree" 2>/dev/null || true
+  git -C "$repo" worktree prune 2>/dev/null || true
+  
+  state_update_session "$id" "status" "paused"
+  ok "Paused session $id. Run 'swarm resume $id' to continue."
+}
+
+cmd_resume() {
+  ensure_deps
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm resume <id>"
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local session_name worktree branch repo agent binary
+  session_name=$(state_find_session "$id" | jq -r '.tmuxSession')
+  worktree=$(state_find_session "$id" | jq -r '.worktree')
+  branch=$(state_find_session "$id" | jq -r '.branch')
+  repo=$(state_find_session "$id" | jq -r '.repo')
+  agent=$(state_find_session "$id" | jq -r '.agent')
+  binary=$(state_find_session "$id" | jq -r '.binary')
+  prompt=$(state_find_session "$id" | jq -r '.prompt')
+  
+  # Recreate worktree from existing branch
+  info "Recreating worktree from branch $branch..."
+  git -C "$repo" worktree add "$worktree" "$branch" 2>/dev/null \
+    || die "Failed to recreate worktree"
+  
+  # Rebuild agent command (without prompt for resume — agent picks up where it left off)
+  local agent_cmd
+  agent_cmd=$(resolve_agent "$agent")
+  
+  # Recreate tmux session
+  info "Resuming ${BOLD}$agent${NC} in tmux..."
+  tmux-swarm new-session -d -s "$session_name" -c "$worktree" "$agent_cmd" 2>/dev/null \
+    || { git -C "$repo" worktree remove -f "$worktree" 2>/dev/null; die "Failed to create tmux session"; }
+  
+  state_update_session "$id" "status" "running"
+  ok "Resumed session $id. Run 'swarm attach $id' to view."
+}
+
+cmd_stop() {
+  ensure_deps
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm stop <id>"
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local session_name worktree branch repo
+  session_name=$(state_find_session "$id" | jq -r '.tmuxSession')
+  worktree=$(state_find_session "$id" | jq -r '.worktree')
+  branch=$(state_find_session "$id" | jq -r '.branch')
+  repo=$(state_find_session "$id" | jq -r '.repo')
+  
+  # Kill tmux session
+  if tmux-swarm has-session -t "$session_name" 2>/dev/null; then
+    tmux-swarm kill-session -t "$session_name" 2>/dev/null || true
+  fi
+  
+  # Remove worktree
+  if [ -d "$worktree" ]; then
+    git -C "$repo" worktree remove --force "$worktree" 2>/dev/null || true
+  fi
+  git -C "$repo" worktree prune 2>/dev/null || true
+  
+  # Delete branch
+  git -C "$repo" branch -D "$branch" 2>/dev/null || true
+  
+  # Remove from state
+  state_remove_session "$id"
+  ok "Stopped and cleaned up session $id"
+}
+
+cmd_diff() {
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm diff <id>"
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local worktree base_commit
+  worktree=$(state_find_session "$id" | jq -r '.worktree')
+  base_commit=$(state_find_session "$id" | jq -r '.baseCommit')
+  
+  if [ ! -d "$worktree" ]; then
+    die "Worktree not found (session may be paused). Run 'swarm resume $id' first."
+  fi
+  
+  info "Diff for session $id (vs $base_commit)"
+  git -C "$worktree" diff "$base_commit" 2>/dev/null || git -C "$worktree" diff 2>/dev/null || warn "No changes"
+}
+
+cmd_merge() {
+  ensure_deps
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm merge <id>"
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local worktree branch repo base_commit
+  worktree=$(state_find_session "$id" | jq -r '.worktree')
+  branch=$(state_find_session "$id" | jq -r '.branch')
+  repo=$(state_find_session "$id" | jq -r '.repo')
+  base_commit=$(state_find_session "$id" | jq -r '.baseCommit')
+  
+  # Check for uncommitted changes
+  if [ -d "$worktree" ]; then
+    git -C "$worktree" add -A 2>/dev/null || true
+    git -C "$worktree" commit -m "swarm: auto-save before merge ($id)" --no-verify 2>/dev/null || true
+  fi
+  
+  info "Merging $branch into $(default_branch)..."
+  git -C "$repo" checkout "$(default_branch)" 2>/dev/null || true
+  git -C "$repo" merge "$branch" --no-ff -m "swarm: merge $branch" 2>/dev/null \
+    || { warn "Merge conflict. Resolve manually in $repo"; return 1; }
+  
+  ok "Merged $branch into $(default_branch)"
+  echo ""
+  echo "  ${DIM}To push:${NC}  git -C $repo push origin $(default_branch)"
+  echo "  ${DIM}To clean up:${NC}  swarm stop $id"
+}
+
+cmd_preview() {
+  local id="${1:-}"
+  [ -z "$id" ] && die "Usage: swarm preview <id>"
+  state_session_exists "$id" || die "Session not found: $id"
+  
+  local session_name status
+  session_name=$(state_find_session "$id" | jq -r '.tmuxSession')
+  status=$(state_find_session "$id" | jq -r '.status')
+  
+  if [ "$status" = "paused" ]; then
+    echo "${DIM}Session is paused. Run 'swarm resume $id' first.${NC}"
+    return 0
+  fi
+  
+  if ! tmux-swarm has-session -t "$session_name" 2>/dev/null; then
+    echo "${DIM}tmux session not running.${NC}"
+    return 0
+  fi
+  
+  echo "${BOLD}Preview of $id${NC} (last 30 lines)"
+  echo "─────────────────────────────────────────────────"
+  tmux-swarm capture-pane -p -t "$session_name" -S -30 2>/dev/null || echo "${DIM}(no output)${NC}"
+}
+
+cmd_install() {
+  local script_path
+  script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  local bin_dir="$HOME/.local/bin"
+  mkdir -p "$bin_dir"
+  
+  if [ -L "$bin_dir/swarm" ]; then
+    rm "$bin_dir/swarm"
+  fi
+  ln -s "$script_path" "$bin_dir/swarm"
+  chmod +x "$script_path"
+  ok "Installed swarm to $bin_dir/swarm"
+  echo "  Restart your terminal or run: source ~/.zshrc"
+}
+
+cmd_version() {
+  echo "swarm v$VERSION"
+}
+
+cmd_help() {
+  cat << 'HELP'
+swarm — minimal, secure agent orchestrator
+
+USAGE
+  swarm <command> [args]
+
+COMMANDS
+  agents                   List all known agents and availability
+  launch <agent> [prompt]   Launch an agent in a new worktree + tmux session
+  list                     Show all sessions (running, paused)
+  attach <id>              Attach to a running session (Ctrl-B D to detach)
+  pause <id>               Pause a session (commit work, free disk, keep branch)
+  resume <id>              Resume a paused session
+  stop <id>                Kill session + cleanup worktree + delete branch
+  diff <id>                Show git diff for a session
+  merge <id>               Merge a session's branch into main
+  preview <id>             Show last 30 lines of a session's terminal
+  install                  Symlink swarm to ~/.local/bin
+  version                  Show version
+  help                     Show this help
+
+AGENTS
+  claude, codex, agy, antigravity, pocket, kiro, grok,
+  opencode, cursor, cursor-agent, copilot, muse
+
+EXAMPLES
+  swarm agents
+  swarm launch claude "fix the login bug"
+  swarm launch codex "add unit tests for auth"
+  swarm list
+  swarm attach abc123-def0
+  swarm pause abc123-def0
+  swarm diff abc123-def0
+  swarm merge abc123-def0
+  swarm stop abc123-def0
+HELP
+}
+
+# ─── Main ─────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  
+  case "$cmd" in
+    agents)    cmd_agents "$@" ;;
+    launch)    cmd_launch "$@" ;;
+    list|ls)   cmd_list "$@" ;;
+    attach)    cmd_attach "$@" ;;
+    pause)     cmd_pause "$@" ;;
+    resume)    cmd_resume "$@" ;;
+    stop|kill) cmd_stop "$@" ;;
+    diff)      cmd_diff "$@" ;;
+    merge)     cmd_merge "$@" ;;
+    preview)   cmd_preview "$@" ;;
+    install)   cmd_install "$@" ;;
+    version|-v|--version) cmd_version ;;
+    help|-h|--help) cmd_help ;;
+    *) die "Unknown command: $cmd. Run 'swarm help'." ;;
+  esac
+}
+
+main "$@"
